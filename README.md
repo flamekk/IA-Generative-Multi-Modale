@@ -8,6 +8,8 @@ Le pipeline d’ingestion existant extrait les pages, le texte, les images et le
 
 Le flux de question-réponse est : Streamlit → agent LangChain → outils de recherche LlamaIndex/PGVector (BGE-M3 pour texte, CLIP pour images) → Qwen3 via Ollama. Une photo facultative est décrite par Qwen2.5-VL et comparée aux figures indexées avec CLIP. Les réponses doivent citer le fichier et la page; les résultats affichent aussi les extraits et les figures retrouvées.
 
+La recherche texte/image fusionne les rangs avec Reciprocal Rank Fusion; les scores bruts BGE-M3 et CLIP ne sont pas additionnés. Les légendes sont dédupliquées et limitées, les anciennes légendes sans version sont régénérées à la prochaine réindexation. Le générateur doit s'en tenir aux passages retrouvés, retirer les citations documentaires non vérifiables et s'abstenir quand aucun passage exploitable n'est disponible.
+
 Le modèle CLIP configuré est `openai/clip-vit-base-patch32`, déjà présent dans le cache local vérifié; il sert aux figures. BGE-M3 est servi localement par Ollama pour les textes. L’OCR des pages scannées, reranking/fine-tuning, outils MCP, historique d’équipement, tickets avec approbation, bot et déploiement multi-service restent des jalons ultérieurs de la feuille de route.
 
 ## Préparation Windows / PowerShell
@@ -36,6 +38,16 @@ Le premier chargement du modèle CLIP exige que son dépôt soit déjà dans le 
 2. Poser une question dans le champ de chat. Les passages, tableaux et descriptions de figures sont recherchés dans PGVector.
 3. Pour une question liée à une photo, joindre une image dans la barre latérale. L’application la décrit avec Qwen2.5-VL et recherche les figures proches avec CLIP.
 4. Ouvrir **Sources documentaires** sous la réponse pour vérifier les pages et les extraits utilisés.
+
+## Tests de non-régression
+
+Depuis PowerShell à la racine du dépôt :
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Ces tests couvrent la déduplication et la limite des légendes, le renouvellement des anciennes légendes, la fusion des rangs texte/image, les métadonnées de recherche par photo, l'abstention sans preuve et le filtrage des citations non indexées. Ils ne nécessitent ni Ollama ni PostgreSQL.
 
 Les PDF téléversés sont conservés sous `data/documents/`. Les résultats d’extraction restent dans `data/extracted/`, et les manifestes dans `data/processed/`. L’index pgvector utilise le volume Docker `maintidoc_pgdata` et survit aux redémarrages. Ne pas supprimer ce volume pour arrêter le service.
 

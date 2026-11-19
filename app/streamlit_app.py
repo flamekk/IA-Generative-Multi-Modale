@@ -15,8 +15,51 @@ from src.agents.rag_agent import answer_question
 
 settings = get_settings()
 st.set_page_config(page_title="MAINTiDOC", page_icon="🛠️", layout="wide")
-st.title("MAINTiDOC")
-st.caption("Assistant documentaire local pour les PDF techniques — réponses avec références de page.")
+st.markdown(
+    """
+    <style>
+      :root { --mainti-navy: #10283f; --mainti-blue: #1d4564; --mainti-amber: #e7a938; --mainti-paper: #f4f7f9; }
+      .stApp { background: var(--mainti-paper); }
+      [data-testid="stSidebar"] { background: linear-gradient(180deg,#10283f 0%,#183a56 100%); }
+      [data-testid="stSidebar"] * { color: #eef5fa; }
+      [data-testid="stSidebar"] [data-testid="stFileUploader"] section { background: #ffffff12; border-color: #ffffff38; }
+      [data-testid="stSidebar"] button[kind="primary"] { background: var(--mainti-amber); color: #10283f; border: 0; font-weight: 700; }
+      .mainti-hero { padding: 1.2rem 1.5rem; border-radius: 18px; color: white; background: linear-gradient(115deg,#10283f,#1d4564); margin: .25rem 0 1rem; }
+      .mainti-eyebrow { color: #f3bd5f; text-transform: uppercase; font-size: .72rem; letter-spacing: .13em; font-weight: 700; }
+      .mainti-hero h1 { color: white; margin: .2rem 0 .25rem; font-size: 2rem; }
+      .mainti-hero p { color: #d5e3ed; margin: 0; }
+      .mainti-chip { display: inline-block; padding: .42rem .72rem; margin: .2rem .35rem .45rem 0; background: white; border: 1px solid #dce5eb; border-radius: 999px; color: #24445d; font-size: .82rem; }
+      [data-testid="stChatMessage"] { background: white; border: 1px solid #e2e9ee; border-radius: 16px; padding: .65rem 1rem; box-shadow: 0 5px 18px #183a5608; }
+      [data-testid="stChatInput"] textarea { border-radius: 14px; }
+      [data-testid="stExpander"] { border-color: #dce5eb; border-radius: 12px; }
+      @media (max-width: 700px) { .mainti-hero { padding: 1rem; } .mainti-hero h1 { font-size: 1.6rem; } }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<div class="mainti-hero"><div class="mainti-eyebrow">Assistant de maintenance · espace local</div>'
+    '<h1>MAINTiDOC</h1><p>Retrouve les informations utiles dans tes documents techniques, avec leurs pages à l’appui.</p></div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<span class="mainti-chip">🔒 Traitement local</span>'
+    '<span class="mainti-chip">📄 Sources paginées</span>'
+    '<span class="mainti-chip">🖼️ Photo facultative</span>',
+    unsafe_allow_html=True,
+)
+
+
+def _render_sources(sources: list[dict]) -> None:
+    for source in sources:
+        page = source.get("page_number") or "?"
+        kind = {"text": "Texte", "table": "Tableau", "image": "Figure"}.get(source.get("content_type"), "Source")
+        with st.container(border=True):
+            st.markdown(f"**{source['source_file']}**  ·  page {page}  ·  {kind}")
+            st.caption(source.get("text", "")[:1200])
+            image_path = source.get("image_path")
+            if source.get("content_type") == "image" and image_path and Path(image_path).is_file():
+                st.image(image_path, caption=f"Figure de la page {page}", use_container_width=True)
 
 
 def _save_uploaded_pdf(uploaded_file) -> Path:
@@ -41,13 +84,17 @@ def _save_uploaded_pdf(uploaded_file) -> Path:
 
 
 with st.sidebar:
+    st.markdown("<div class='mainti-eyebrow'>Espace de travail</div>", unsafe_allow_html=True)
     st.header("Documents")
+    st.caption("Ajoute un manuel, une procédure ou une fiche technique.")
     uploaded_pdf = st.file_uploader("Ajouter un PDF technique", type=["pdf"], max_upload_size=100)
     if st.button("Extraire et indexer", type="primary", disabled=uploaded_pdf is None, use_container_width=True):
         try:
             pdf_path = _save_uploaded_pdf(uploaded_pdf)
-            with st.spinner("Extraction, analyse des figures et indexation PGVector…"):
+            with st.status("Préparation du document…", expanded=True) as status:
+                st.write("Extraction du texte, des tableaux et des figures")
                 result = index_pdf(pdf_path)
+                status.update(label="Document indexé", state="complete", expanded=False)
             st.success(
                 f"Indexé : {result['source_filename']} · {result['page_count']} pages · "
                 f"{result['indexed_node_count']} passages · {len(result.get('image_descriptions', []))} figures"
@@ -59,6 +106,7 @@ with st.sidebar:
 
     st.divider()
     st.header("Photo facultative")
+    st.caption("Ajoute une photo pour rechercher des figures similaires dans les PDF indexés.")
     uploaded_image = st.file_uploader(
         "Ajouter une photo à comparer aux figures indexées",
         type=["png", "jpg", "jpeg", "webp"],
@@ -69,7 +117,7 @@ with st.sidebar:
         st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
 
     st.divider()
-    st.caption(f"Vision : {settings.vision_model}\n\nGénération : {settings.generation_model}\n\nIndex : PostgreSQL + pgvector")
+    st.caption(f"Modèles locaux\n\nVision · {settings.vision_model}\n\nRéponse · {settings.generation_model}\n\nIndex documentaire · PostgreSQL + pgvector")
 
 
 if "chat" not in st.session_state:
@@ -80,13 +128,7 @@ for turn in st.session_state.chat:
         st.markdown(turn["content"])
         if turn.get("sources"):
             with st.expander("Sources documentaires"):
-                for source in turn["sources"]:
-                    page = source.get("page_number") or "?"
-                    st.markdown(f"**{source['source_file']} — page {page}** · {source['content_type']}")
-                    st.caption(source["text"][:1200])
-                    image_path = source.get("image_path")
-                    if source["content_type"] == "image" and image_path and Path(image_path).is_file():
-                        st.image(image_path, width=360)
+                _render_sources(turn["sources"])
         if turn.get("warning"):
             st.warning(turn["warning"])
 
@@ -106,13 +148,7 @@ if question:
                     st.write(response["vision_description"])
             if response["sources"]:
                 with st.expander("Sources documentaires"):
-                    for source in response["sources"]:
-                        page = source.get("page_number") or "?"
-                        st.markdown(f"**{source['source_file']} — page {page}** · {source['content_type']}")
-                        st.caption(source["text"][:1200])
-                        image_path = source.get("image_path")
-                        if source["content_type"] == "image" and image_path and Path(image_path).is_file():
-                            st.image(image_path, width=360)
+                    _render_sources(response["sources"])
             if response["agent_warning"]:
                 st.warning(response["agent_warning"])
             st.session_state.chat.append(

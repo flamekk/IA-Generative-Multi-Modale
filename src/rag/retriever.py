@@ -15,7 +15,7 @@ from llama_index.core.vector_stores.types import VectorStoreQueryMode
 from src.config import get_settings
 from src.embeddings.image_embeddings import embed_image
 from src.embeddings.text_embeddings import BgeM3TextEmbedding, ClipTextEmbedding
-from src.rag.generator import describe_image
+from src.rag.generator import describe_image, normalize_model_text
 from src.vectorstore.pgvector_store import (
     get_image_index,
     get_image_vector_store,
@@ -24,8 +24,25 @@ from src.vectorstore.pgvector_store import (
 )
 
 
+CAPTION_SCHEMA_VERSION = 2
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_cached_captions(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            item.get("filename"): item.get("caption", "")
+            for item in records
+            if item.get("caption") and item.get("schema_version") == CAPTION_SCHEMA_VERSION
+        }
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return {}
 
 
 def _table_text(table: dict[str, Any]) -> str:
@@ -87,29 +104,21 @@ def index_pdf(pdf_path: str | Path) -> dict[str, Any]:
     image_records = manifest.get("images", [])
     image_root = settings.project_root / "data" / "extracted" / "images" / document_id
     captions_path = image_root / "captions.json"
-    cached_captions = {}
-    if captions_path.is_file():
-        try:
-            cached_captions = {
-                item.get("filename"): item.get("caption", "")
-                for item in json.loads(captions_path.read_text(encoding="utf-8"))
-                if item.get("caption")
-            }
-        except (OSError, json.JSONDecodeError, AttributeError):
-            cached_captions = {}
+    cached_captions = _load_cached_captions(captions_path)
     for image in image_records:
         image_path = Path(image["path"])
         if not image_path.is_absolute():
             image_path = settings.project_root / image_path
         page_number = int(image["page_number"])
-        caption = cached_captions.get(image["filename"], "")
+        caption = normalize_model_text(cached_captions.get(image["filename"], ""))
         if not caption:
             try:
-                caption = describe_image(image_path, page_number)
+                caption = normalize_model_text(describe_image(image_path, page_number))
             except RuntimeError as error:
                 caption = ""
                 manifest.setdefault("warnings", []).append(f"Image {image['filename']} : {error}")
         caption_record = {
+            "schema_version": CAPTION_SCHEMA_VERSION,
             "page_number": page_number,
             "filename": image["filename"],
             "caption": caption,
@@ -166,17 +175,46 @@ def _as_evidence(node: Any, score: float | None) -> dict[str, Any]:
     }
 
 
+def _evidence_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    text_key = " ".join(str(item.get("text", "")).casefold().split())
+    return (
+        item.get("source_file"),
+        item.get("page_number"),
+        item.get("content_type"),
+        item.get("image_path") or text_key,
+    )
+
+
+def reciprocal_rank_fusion(
+    *ranked_groups: list[dict[str, Any]], limit: int, rank_constant: int = 60
+) -> list[dict[str, Any]]:
+    """Fuse independent retrievers by rank; their raw similarity scores are not comparable."""
+    fused: dict[tuple[Any, ...], dict[str, Any]] = {}
+    totals: dict[tuple[Any, ...], float] = {}
+    for group in ranked_groups:
+        seen_in_group: set[tuple[Any, ...]] = set()
+        for rank, item in enumerate(group, start=1):
+            key = _evidence_key(item)
+            if key in seen_in_group:
+                continue
+            seen_in_group.add(key)
+            totals[key] = totals.get(key, 0.0) + 1.0 / (rank_constant + rank)
+            fused.setdefault(key, {**item, "retrieval_score": item.get("score"), "score": None})
+    ordered = sorted(fused, key=lambda key: totals[key], reverse=True)
+    return [{**fused[key], "rank_score": totals[key]} for key in ordered[:limit]]
+
+
 def search_documents(query: str, top_k: int | None = None) -> list[dict[str, Any]]:
     settings = get_settings()
     limit = top_k or settings.retrieval_top_k
     text_index: VectorStoreIndex = get_text_index()
     image_index: VectorStoreIndex = get_image_index()
-    text_retriever = text_index.as_retriever(similarity_top_k=limit)
-    image_retriever = image_index.as_retriever(similarity_top_k=max(1, limit // 3))
+    candidate_k = max(limit * 3, limit)
+    text_retriever = text_index.as_retriever(similarity_top_k=candidate_k)
+    image_retriever = image_index.as_retriever(similarity_top_k=candidate_k)
     text_evidence = [_as_evidence(item.node, item.score) for item in text_retriever.retrieve(query)]
     image_evidence = [_as_evidence(item.node, item.score) for item in image_retriever.retrieve(query)]
-    # Keep rankings separate: BGE text and CLIP figure scores are not comparable.
-    return text_evidence + image_evidence
+    return reciprocal_rank_fusion(text_evidence, image_evidence, limit=limit)
 
 
 def search_by_image(image_bytes: bytes, top_k: int | None = None) -> list[dict[str, Any]]:
@@ -190,15 +228,19 @@ def search_by_image(image_bytes: bytes, top_k: int | None = None) -> list[dict[s
         )
     )
     scores = result.similarities or [None] * len(result.nodes or [])
-    return [_as_evidence(node, scores[index] if index < len(scores) else None) for index, node in enumerate(result.nodes or [])]
+    return [
+        {**_as_evidence(node, scores[index] if index < len(scores) else None), "rank_score": None}
+        for index, node in enumerate(result.nodes or [])
+    ]
 
 
 def format_evidence(evidence: list[dict[str, Any]]) -> str:
     if not evidence:
         return "Aucun passage pertinent n'a été trouvé dans l'index."
     blocks = []
-    for item in evidence:
+    for item in evidence[:8]:
         page = item.get("page_number")
         page_label = f"page {page}" if page else "page inconnue"
-        blocks.append(f"[{item['source_file']}, {page_label}, {item['content_type']}]\n{item['text']}")
+        text = " ".join(str(item.get("text", "")).split())[:1400]
+        blocks.append(f"[{item['source_file']}, {page_label}] ({item['content_type']})\n{text}")
     return "\n\n---\n\n".join(blocks)
